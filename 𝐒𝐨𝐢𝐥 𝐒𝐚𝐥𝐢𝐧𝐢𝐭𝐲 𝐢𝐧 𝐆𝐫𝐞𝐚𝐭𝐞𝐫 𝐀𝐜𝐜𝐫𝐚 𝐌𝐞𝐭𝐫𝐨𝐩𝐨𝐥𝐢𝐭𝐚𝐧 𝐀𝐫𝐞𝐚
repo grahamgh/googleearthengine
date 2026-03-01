@@ -1,0 +1,148 @@
+// ---------------------- Load Ghana Shapefile ----------------------
+var districts = ee.FeatureCollection("projects/gee-training-485617/assets/Ghana_ShapeFile");
+
+// List of Greater Accra districts exactly as in your shapefile
+var gamaDistricts = [
+  'Accra Metropolitan',
+  'Tema Metropolitan',
+  'Ga East',
+  'Ga West',
+  'Ga South',
+  'La Dade-Kotopon',
+  'La Nkwantanang-Madina',
+  'Kpone-Katamanso',
+  'Adenta',
+  'Ashaiman'
+];
+
+// Filter AOI for Greater Accra
+var AOI = districts.filter(ee.Filter.inList('ADM2_NAME', gamaDistricts));
+Map.centerObject(AOI, 10);
+
+// ---------------------- Salinity Processing Function ----------------------
+function processImage(image) {
+  // Cloud and cirrus masking
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+             .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  
+  // Optional NDWI masking (water pixels)
+  var ndwi = image.normalizedDifference(['B3', 'B8']);
+  // var waterMask = ndwi.gt(0.1); // uncomment if needed
+
+  // Salinity Index (sqrt(Blue*Red))
+  var blue = image.select('B2').divide(10000);
+  var red = image.select('B4').divide(10000);
+  var si = blue.multiply(red).sqrt().rename('Salinity_Index');
+
+  return si.updateMask(mask) // .updateMask(waterMask) optional
+           .copyProperties(image, ['system:time_start']);
+}
+
+// ---------------------- Process Sentinel-2 ImageCollection ----------------------
+var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI)
+  .filterDate('2023-01-01', '2024-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+  .map(processImage);
+
+print('Dataset size:', dataset.size());
+
+// ---------------------- Median Salinity Map ----------------------
+var medianSI = dataset.median().clip(AOI);
+
+var siVis = {
+  min: 0.02, 
+  max: 0.12, 
+  palette: ['000080', '008080', 'FFFF00', 'FF0000']
+};
+
+Map.setOptions('HYBRID');
+Map.addLayer(medianSI, siVis, 'GAMA Soil Salinity');
+
+// ---------------------- District Border ----------------------
+var border = ee.Image().paint(AOI, 0, 2);
+Map.addLayer(border, {palette: 'white'}, 'GAMA Border');
+
+// ---------------------- Salinity Trend Chart ----------------------
+var chartCol = dataset; // processed dataset
+
+var chart = ui.Chart.image.series({
+  imageCollection: chartCol,
+  region: AOI,
+  reducer: ee.Reducer.median(),
+  scale: 100,       // safe scale for GAMA
+  xProperty: 'system:time_start',
+  bestEffort: true  // prevents maxPixels error
+})
+.setOptions({
+  title: 'Greater Accra Metropolitan Area Salinity Trend (2020-2024)',
+  vAxis: {title: 'Avg Salinity Index'},
+  hAxis: {title: 'Date', format: 'MMM yy'},
+  colors: ['#008080'], 
+  lineWidth: 2,
+  pointSize: 3
+});
+
+chart.style().set({
+  position: 'bottom-right',
+  width: '350px',
+  height: '250px'
+});
+Map.add(chart);
+
+// ---------------------- Title Panel ----------------------
+var titlePanel = ui.Panel({
+  style: {position: 'top-center', padding: '10px', backgroundColor: 'rgba(255, 255, 255, 0.9)'}
+});
+var title = ui.Label('Greater Accra Soil Salinity Map', {fontWeight: 'bold', fontSize: '20px', color: '#006064'});
+var sub = ui.Label('Micro-analysis of salt accumulation (2023-2024)', {fontSize: '12px', color: '#555'});
+titlePanel.add(title).add(sub);
+Map.add(titlePanel);
+
+// ---------------------- Legend ----------------------
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px', backgroundColor: 'rgba(255, 255, 255, 0.9)'}});
+var legTitle = ui.Label('Salinity Level', {fontWeight: 'bold'});
+legend.add(legTitle);
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({style: {backgroundColor: '#' + color, padding: '8px', margin: '0 4px 4px 0'}});
+  var desc = ui.Label({value: name, style: {margin: '0 0 4px 6px'}});
+  return ui.Panel({widgets: [colorBox, desc], layout: ui.Panel.Layout.Flow('horizontal')});
+};
+
+legend.add(makeRow('FF0000', 'High (Relative to District)'));
+legend.add(makeRow('FFFF00', 'Moderate'));
+legend.add(makeRow('008080', 'Low'));
+legend.add(makeRow('000080', 'Non-Saline / Vegetation'));
+Map.add(legend);
+
+// ---------------------- Credit Panel ----------------------
+var creditPanel = ui.Panel({
+  style: {
+    position: 'top-right',
+    padding: '8px 12px',
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    border: '1px solid #ccc'
+  }
+});
+
+var creditText = ui.Label('Credit: Anindo', {fontSize: '14px', fontWeight: 'bold', margin: '0 0 4px 0'});
+var linkedInText = ui.Label('LinkedIn: anindo046', {fontSize: '12px', color: '#0077b5', margin: '0'});
+
+creditPanel.add(creditText).add(linkedInText);
+Map.add(creditPanel);
+
+// ---------------------- Optional Export to Drive ----------------------
+Export.image.toDrive({
+  image: medianSI,
+  description: 'GAMA_Salinity_Map',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'GAMA_Salinity_2023_2024',
+  region: AOI.geometry(),
+  scale: 100,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
