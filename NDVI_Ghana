@@ -1,0 +1,31 @@
+
+//First add the shapefile of your area of interest
+//In search box, type Landsat 9. Select the Tier 1 TOA Reflectance and copy the collection snippet.
+
+//import landsat images and filter
+var landsat9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_TOA")
+  .filterBounds(AOI)
+  .filterDate('2023-01-01', '2023-12-31')
+  .filterMetadata('CLOUD_COVER', 'less_than', 20)
+  .mean()
+  .clip(AOI);
+
+//Calculate NDVI
+var NIR = landsat9.select('B5');
+var RED = landsat9.select('B4');
+var NDVI = NIR.subtract(RED).divide(NIR.add(RED)).rename('NDVI');
+
+var NDVIparameters = {min: -1, max: 1, palette: ['Yellow', 'Green', 'Red']};
+
+//Display the result
+Map.addLayer(NDVI, NDVIparameters, 'NDVI Image');
+Map.centerObject(AOI, 8);
+
+//Export and save result
+Export.image.toDrive({
+  image: NDVI,
+  description: 'NDVI',
+  scale: 30,
+  region: AOI,
+  maxPixels: 1e13
+});
