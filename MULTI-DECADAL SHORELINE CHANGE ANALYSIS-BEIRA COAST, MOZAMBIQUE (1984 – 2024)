@@ -1,0 +1,176 @@
+// ============================================================
+// MULTI-DECADAL SHORELINE CHANGE ANALYSIS
+// BEIRA COAST, MOZAMBIQUE  |  Pungwe River Delta & Urban Shore
+// 1984 – 2024  ·  FIXED: empty-collection MNDWI band errors
+// ============================================================
+
+// ── 1. AREA OF INTEREST ──────────────────────────────────────
+var roi = ee.Geometry.Polygon([[
+  [34.68, -19.72], [34.98, -19.72],
+  [34.98, -20.02], [34.68, -20.02],
+  [34.68, -19.72]
+]]);
+
+Map.setOptions('SATELLITE');
+Map.centerObject(roi, 11);
+Map.addLayer(roi, {color: 'FFFFFF', fillColor: '00000000'}, 'Study Area – Beira Coast');
+
+
+// ── 2. CLOUD & SHADOW MASKING (Landsat C2 SR) ────────────────
+function maskLandsat(image) {
+  var qa     = image.select('QA_PIXEL');
+  var cloud  = qa.bitwiseAnd(1 << 3).eq(0);
+  var shadow = qa.bitwiseAnd(1 << 4).eq(0);
+  var snow   = qa.bitwiseAnd(1 << 5).eq(0);
+  return image
+    .updateMask(cloud).updateMask(shadow).updateMask(snow)
+    .multiply(0.0000275).add(-0.2)
+    .copyProperties(image, ['system:time_start']);
+}
+
+
+// ── 3. ADD MNDWI BAND ────────────────────────────────────────
+function addMNDWI(image, greenBand, swirBand) {
+  return image.addBands(
+    image.normalizedDifference([greenBand, swirBand]).rename('MNDWI')
+  );
+}
+
+
+// ── 4. ANNUAL MEDIAN COMPOSITE ───────────────────────────────
+//  ✅  FIX: ee.Algorithms.If evaluates BOTH branches, so L8/L9
+//     composites are computed even for L5 years (and vice-versa).
+//     An empty seasonal collection → median() has no bands →
+//     .select('MNDWI') throws the error you saw.
+//     Solution: return a safe all-(-1) MNDWI fallback when the
+//     filtered collection is empty.  MNDWI < 0 = no water,
+//     so it contributes nothing to the shoreline extraction.
+function annualComposite(collection, year, greenBand, swirBand) {
+  var start    = ee.Date.fromYMD(year, 5, 1);
+  var end      = ee.Date.fromYMD(year, 10, 31);
+  var filtered = collection.filterDate(start, end);
+
+  var composite = filtered
+    .map(maskLandsat)
+    .map(function(img) { return addMNDWI(img, greenBand, swirBand); })
+    .median()
+    .clip(roi);
+
+  // Safe fallback: single-band MNDWI image, all pixels = -1 (no water)
+  var fallback = ee.Image.constant(-1).rename('MNDWI').clip(roi);
+
+  // If the seasonal collection was empty, use fallback instead
+  return ee.Image(
+    ee.Algorithms.If(filtered.size().gt(0), composite, fallback)
+  );
+}
+
+
+// ── 5. LANDSAT COLLECTIONS ───────────────────────────────────
+var L5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').filterBounds(roi);
+var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterBounds(roi);
+var L9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2').filterBounds(roi);
+
+
+// ── 6. SENSOR SELECTOR ───────────────────────────────────────
+//  Now safe: both branches always return an image with MNDWI band
+function selectSensorComposite(year) {
+  year = ee.Number(year);
+  return ee.Image(
+    ee.Algorithms.If(
+      year.lte(2012),
+        annualComposite(L5, year, 'SR_B2', 'SR_B5'),   // Landsat 5
+      ee.Algorithms.If(
+        year.lte(2021),
+          annualComposite(L8, year, 'SR_B3', 'SR_B6'), // Landsat 8
+          annualComposite(L9, year, 'SR_B3', 'SR_B6')  // Landsat 9
+      )
+    )
+  );
+}
+
+
+// ── 7. SHORELINE EXTRACTION ───────────────────────────────────
+var years = ee.List.sequence(1984, 2024);
+
+var shorelines = years.map(function(y) {
+  y = ee.Number(y);
+  var img = selectSensorComposite(y);
+
+  // MNDWI > 0  →  water pixel
+  var water = img.select('MNDWI').gt(0).selfMask().toInt();
+
+  var waterVec = water.reduceToVectors({
+    geometry      : roi,
+    scale         : 30,
+    geometryType  : 'polygon',
+    eightConnected: true,
+    labelProperty : 'water',
+    maxPixels     : 1e13,
+    bestEffort    : true
+  });
+
+  var sensor = ee.String(ee.Algorithms.If(
+    y.lte(2012), 'L5',
+    ee.Algorithms.If(y.lte(2021), 'L8', 'L9')
+  ));
+
+  return waterVec.map(function(f) {
+    return f.set({
+      'year'  : y,
+      'sensor': sensor,
+      'decade': y.divide(10).floor().multiply(10)
+    });
+  });
+});
+
+
+// ── 8. FLATTEN ───────────────────────────────────────────────
+var shorelinesCol = ee.FeatureCollection(shorelines).flatten();
+
+
+// ── 9. VISUALISATION ─────────────────────────────────────────
+var dec1984 = shorelinesCol.filter(ee.Filter.rangeContains('year', 1984, 1999));
+var dec2000 = shorelinesCol.filter(ee.Filter.rangeContains('year', 2000, 2018));
+var dec2019 = shorelinesCol.filter(ee.Filter.rangeContains('year', 2019, 2024));
+
+Map.addLayer(dec1984, {color: '1E90FF'}, 'Shorelines 1984–1999 (blue)');
+Map.addLayer(dec2000, {color: 'FFD700'}, 'Shorelines 2000–2018 (yellow)');
+Map.addLayer(dec2019, {color: 'FF4500'}, 'Shorelines 2019–2024 (red – post-Idai)');
+
+
+// ── 10. OPTIONAL: INSPECT A SPECIFIC YEAR ────────────────────
+// var img2019 = selectSensorComposite(2019);
+// var img1990 = selectSensorComposite(1990);
+// Map.addLayer(img2019, {bands:['SR_B4','SR_B3','SR_B2'], min:0, max:0.3}, '2019 RGB');
+// Map.addLayer(img1990, {bands:['SR_B3','SR_B2','SR_B1'], min:0, max:0.3}, '1990 RGB');
+
+
+// ── 11. EXPORTS ──────────────────────────────────────────────
+Export.table.toDrive({
+  collection : shorelinesCol,
+  description: 'Beira_Coast_Annual_Shorelines_1984_2024',
+  folder     : 'GEE_Exports', fileFormat: 'SHP'
+});
+Export.table.toDrive({
+  collection : dec1984,
+  description: 'Beira_Shorelines_1984_1999',
+  folder     : 'GEE_Exports', fileFormat: 'SHP'
+});
+Export.table.toDrive({
+  collection : dec2000,
+  description: 'Beira_Shorelines_2000_2018',
+  folder     : 'GEE_Exports', fileFormat: 'SHP'
+});
+Export.table.toDrive({
+  collection : dec2019,
+  description: 'Beira_Shorelines_2019_2024',
+  folder     : 'GEE_Exports', fileFormat: 'SHP'
+});
+
+
+// ── 12. QC ───────────────────────────────────────────────────
+print('L5 scene count in ROI:', L5.size());
+print('L8 scene count in ROI:', L8.size());
+print('L9 scene count in ROI:', L9.size());
+print('Total shoreline features:', shorelinesCol.size());
